@@ -28,6 +28,7 @@ except ImportError:
 from data import DataMixin
 from step import StepMixin
 from ema import update_ema
+from action_dmd import FakeActionScore, ActionDMDReplayBuffer
 
 
 class FlashWAMDistiller(DataMixin, StepMixin):
@@ -46,6 +47,7 @@ class FlashWAMDistiller(DataMixin, StepMixin):
         self.distill_action = getattr(config, 'distill_action', False)
         self.action_distill_mode = getattr(config, 'action_distill_mode', 'consistency')
         self.action_aware = getattr(config, 'action_aware', False)
+        self.enable_action_dmd = getattr(config, 'enable_action_dmd', False)
         self.k_action = config.num_train_timesteps // getattr(
             config, 'num_ddim_timesteps_action', config.num_ddim_timesteps)
 
@@ -84,6 +86,11 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                             f"mode = {self.action_distill_mode}")
             if self.action_aware:
                 logger.info(f"  action_aware_weight = {config.action_aware_weight}")
+            if self.enable_action_dmd:
+                logger.info("Action DMD-lite enabled")
+                logger.info(f"  action_dmd_weight = {config.action_dmd_weight}")
+                logger.info(f"  fake_action_updates = {config.fake_action_updates}")
+                logger.info(f"  replay_size = {config.fake_action_replay_size}")
             logger.info(f"Empty embedding shape: {self.empty_emb.shape}")
 
         # ==============================================================
@@ -162,6 +169,26 @@ class FlashWAMDistiller(DataMixin, StepMixin):
             fused=True,
             foreach=False,
         )
+        self.fake_action_score = None
+        self.fake_action_optimizer = None
+        self.action_dmd_replay = None
+        if self.enable_action_dmd:
+            action_size = config.action_dim * config.frame_chunk_size * config.action_per_frame
+            self.fake_action_score = FakeActionScore(
+                action_size=action_size,
+                hidden_dim=config.fake_action_hidden_dim,
+                depth=config.fake_action_depth,
+            ).to(self.device)
+            self.fake_action_score.train()
+            self.fake_action_optimizer = torch.optim.AdamW(
+                self.fake_action_score.parameters(),
+                lr=config.fake_action_lr,
+                betas=(config.beta1, config.beta2),
+                eps=1e-8,
+                weight_decay=0.0,
+            )
+            self.action_dmd_replay = ActionDMDReplayBuffer(
+                max_size=config.fake_action_replay_size)
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
             lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps),
@@ -200,6 +227,27 @@ class FlashWAMDistiller(DataMixin, StepMixin):
     # Save checkpoint
     # ==================================================================
     def _save_checkpoint(self, which="online_student"):
+        if which == "fake_action_score":
+            if not self.enable_action_dmd or self.fake_action_score is None:
+                return
+            try:
+                if self.config.rank == 0:
+                    ckpt_dir = self.save_dir / f"step_{self.step}" / which
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        self.fake_action_score.state_dict(),
+                        ckpt_dir / "pytorch_model.bin",
+                    )
+                    logger.info(f"  Saved {which} → {ckpt_dir}")
+                if dist.is_initialized():
+                    dist.barrier()
+            except Exception as e:
+                if self.config.rank == 0:
+                    logger.error(f"Failed to save {which}: {e}")
+                if dist.is_initialized():
+                    dist.barrier()
+            return
+
         model = self.student if which == "online_student" else self.target_student
         try:
             state_dict = get_model_state_dict(
@@ -238,6 +286,8 @@ class FlashWAMDistiller(DataMixin, StepMixin):
             mode.append("action")
         if self.action_aware:
             mode.append("action_aware")
+        if self.enable_action_dmd:
+            mode.append("action_dmd")
         mode_str = "+".join(mode) if mode else "none"
         logger.info(f"Starting LCM {mode_str} distillation for {config.max_train_steps} steps ...")
         if self.distill_video:
@@ -247,6 +297,9 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                         f"({config.num_train_timesteps} / {config.num_ddim_timesteps_action})")
             logger.info(f"  action_loss_weight = {config.action_loss_weight}")
             logger.info(f"  action_distill_mode = {self.action_distill_mode}")
+        if self.enable_action_dmd:
+            logger.info(f"  action_dmd_weight = {config.action_dmd_weight}")
+            logger.info(f"  fake_action_updates = {config.fake_action_updates}")
         logger.info(f"  Teacher CFG: [{config.cfg_min}, {config.cfg_max}]")
         logger.info(f"  EMA decay: {config.ema_decay}")
         logger.info(f"  Loss: {config.loss_type}")
@@ -256,6 +309,9 @@ class FlashWAMDistiller(DataMixin, StepMixin):
         acc_video_losses = []
         acc_action_losses = []
         acc_action_aware_losses = []
+        acc_action_dmd_losses = []
+        acc_action_endpoint_losses = []
+        acc_fake_action_losses = []
         step_in_acc = 0
 
         progress_bar = tqdm(
@@ -271,6 +327,9 @@ class FlashWAMDistiller(DataMixin, StepMixin):
             acc_video_losses.append(result["video_loss"])
             acc_action_losses.append(result["action_loss"])
             acc_action_aware_losses.append(result["action_aware_loss"])
+            acc_action_dmd_losses.append(result.get("action_dmd_loss", torch.tensor(0.0, device=self.device)))
+            acc_action_endpoint_losses.append(result.get("action_endpoint_loss", torch.tensor(0.0, device=self.device)))
+            acc_fake_action_losses.append(result.get("fake_action_loss", torch.tensor(0.0, device=self.device)))
             step_in_acc += 1
 
             if result["should_sync"]:
@@ -297,10 +356,16 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 avg_video_loss = dist_mean(torch.stack(acc_video_losses).sum()).item()
                 avg_action_loss = dist_mean(torch.stack(acc_action_losses).sum()).item()
                 avg_action_aware_loss = dist_mean(torch.stack(acc_action_aware_losses).sum()).item()
+                avg_action_dmd_loss = dist_mean(torch.stack(acc_action_dmd_losses).sum()).item()
+                avg_action_endpoint_loss = dist_mean(torch.stack(acc_action_endpoint_losses).sum()).item()
+                avg_fake_action_loss = dist_mean(torch.stack(acc_fake_action_losses).sum()).item()
                 acc_losses = []
                 acc_video_losses = []
                 acc_action_losses = []
                 acc_action_aware_losses = []
+                acc_action_dmd_losses = []
+                acc_action_endpoint_losses = []
+                acc_fake_action_losses = []
                 step_in_acc = 0
 
                 torch.cuda.synchronize()
@@ -329,6 +394,12 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                     if self.action_aware:
                         postfix["aa"] = f"{avg_action_aware_loss:.4f}"
                         log_dict["loss/action_aware"] = avg_action_aware_loss
+                    if self.enable_action_dmd:
+                        postfix["dmd"] = f"{avg_action_dmd_loss:.4f}"
+                        postfix["fake"] = f"{avg_fake_action_loss:.4f}"
+                        log_dict["loss/action_dmd"] = avg_action_dmd_loss
+                        log_dict["loss/action_endpoint"] = avg_action_endpoint_loss
+                        log_dict["loss/fake_action"] = avg_fake_action_loss
                     progress_bar.set_postfix(postfix)
                     if config.enable_wandb and HAS_WANDB:
                         wandb.log(log_dict, step=self.step)
@@ -338,6 +409,8 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 if self.step % config.save_interval == 0:
                     self._save_checkpoint("online_student")
                     self._save_checkpoint("target_student")
+                    if self.enable_action_dmd:
+                        self._save_checkpoint("fake_action_score")
 
             if dist.is_initialized():
                 dist.barrier()
@@ -346,3 +419,5 @@ class FlashWAMDistiller(DataMixin, StepMixin):
         logger.info("Distillation completed!")
         self._save_checkpoint("online_student")
         self._save_checkpoint("target_student")
+        if self.enable_action_dmd:
+            self._save_checkpoint("fake_action_score")

@@ -98,6 +98,28 @@ cfg.action_distill_mode = "x0"          # action consistency function parametriz
 cfg.action_aware_weight = 0.01          # small weight for action-aware regularizer
 
 # ============================================================
+# Action-only distribution matching (DMD-lite, disabled by default)
+# ============================================================
+# This extension keeps the Flash-WAM video/action consistency losses intact and
+# adds a small action-only fake-score correction.  It is intentionally disabled
+# unless ACTION_DMD_ENABLE=1 so the clean Flash-WAM baseline is unchanged.
+cfg.enable_action_dmd = os.environ.get("ACTION_DMD_ENABLE", "0") == "1"
+cfg.action_dmd_weight = float(os.environ.get("ACTION_DMD_WEIGHT", "5e-4"))
+cfg.action_dmd_eta = float(os.environ.get("ACTION_DMD_ETA", "1.0"))
+cfg.action_dmd_warmup_steps = int(os.environ.get("ACTION_DMD_WARMUP_STEPS", "1000"))
+cfg.action_dmd_sigma_min = float(os.environ.get("ACTION_DMD_SIGMA_MIN", "0.05"))
+cfg.action_dmd_sigma_max = float(os.environ.get("ACTION_DMD_SIGMA_MAX", "0.30"))
+cfg.action_dmd_grad_min_scale = float(os.environ.get("ACTION_DMD_GRAD_MIN_SCALE", "0.01"))
+cfg.action_endpoint_weight = float(os.environ.get("ACTION_ENDPOINT_WEIGHT", "0.05"))
+
+cfg.fake_action_hidden_dim = int(os.environ.get("FAKE_ACTION_HIDDEN_DIM", "1024"))
+cfg.fake_action_depth = int(os.environ.get("FAKE_ACTION_DEPTH", "3"))
+cfg.fake_action_lr = float(os.environ.get("FAKE_ACTION_LR", "2.5e-6"))
+cfg.fake_action_updates = int(os.environ.get("FAKE_ACTION_UPDATES", "2"))
+cfg.fake_action_replay_size = int(os.environ.get("FAKE_ACTION_REPLAY_SIZE", "256"))
+cfg.fake_action_replay_batch = int(os.environ.get("FAKE_ACTION_REPLAY_BATCH", "1"))
+
+# ============================================================
 # LCM Hyperparameters
 # ============================================================
 cfg.ema_decay = 0.995

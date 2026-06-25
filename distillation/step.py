@@ -5,6 +5,12 @@ from einops import rearrange
 
 from utils import data_seq_to_patch, logger
 from consistency import scalings_for_boundary_conditions
+from action_dmd import (
+    masked_huber,
+    masked_mse,
+    normalize_dmd_gradient,
+    pooled_video_stats,
+)
 
 
 class StepMixin:
@@ -23,6 +29,139 @@ class StepMixin:
     # ==================================================================
     def _extract_action_v(self, action_pred, num_frames):
         return rearrange(action_pred, 'b (f n) c -> b c f n 1', f=num_frames)
+
+    # ==================================================================
+    # Action x0 conversion matching Flash-WAM's action consistency path.
+    # ==================================================================
+    def _action_x0_from_v(self, noisy_action, v_pred, sigma):
+        sigma_5d = sigma[:, None, :, None, None].to(v_pred.dtype).to(v_pred.device)
+        return noisy_action - sigma_5d * v_pred
+
+    # ==================================================================
+    # Sample action DMD timesteps from the native action scheduler.
+    # ==================================================================
+    def _sample_action_dmd_timesteps(self, batch_size, num_frames):
+        sigmas = self.train_scheduler_action.sigmas.to(self.device)
+        timesteps = self.train_scheduler_action.timesteps.to(self.device)
+        valid = torch.nonzero(
+            (sigmas >= self.config.action_dmd_sigma_min) &
+            (sigmas <= self.config.action_dmd_sigma_max),
+            as_tuple=False,
+        ).flatten()
+        if valid.numel() == 0:
+            valid = torch.arange(sigmas.numel(), device=self.device)
+        choice = valid[torch.randint(0, valid.numel(), (num_frames,), device=self.device)]
+        sigma = sigmas[choice][None].repeat(batch_size, 1)
+        timestep = timesteps[choice][None].repeat(batch_size, 1)
+        return sigma, timestep
+
+    # ==================================================================
+    # Native action scheduler noise wrapper for action endpoints.
+    # ==================================================================
+    def _add_action_dmd_noise(self, action_x0, sigma_timesteps):
+        noise = torch.randn_like(action_x0)
+        return self.train_scheduler_action.add_noise(
+            action_x0, noise, sigma_timesteps, t_dim=2)
+
+    # ==================================================================
+    # Train fake action score on current/replay student action endpoints.
+    # ==================================================================
+    def _update_fake_action_score(self, action_x0, video_stats, mask):
+        if not getattr(self, "enable_action_dmd", False):
+            return torch.tensor(0.0, device=self.device)
+        if self.fake_action_score is None:
+            return torch.tensor(0.0, device=self.device)
+
+        losses = []
+        self.fake_action_score.train()
+        for _ in range(max(1, self.config.fake_action_updates)):
+            fake_actions = action_x0.detach()
+            fake_stats = video_stats.detach()
+            fake_mask = mask.detach()
+            replay = self.action_dmd_replay.sample(
+                self.config.fake_action_replay_batch,
+                device=self.device,
+                dtype=fake_actions.dtype,
+            ) if self.action_dmd_replay is not None else None
+            if replay is not None:
+                replay_actions, replay_stats, replay_mask = replay
+                fake_actions = torch.cat([fake_actions, replay_actions], dim=0)
+                fake_stats = torch.cat([fake_stats, replay_stats], dim=0)
+                fake_mask = torch.cat([fake_mask, replay_mask], dim=0)
+
+            sigma, timesteps = self._sample_action_dmd_timesteps(
+                fake_actions.shape[0], fake_actions.shape[2])
+            noisy = self._add_action_dmd_noise(fake_actions, timesteps)
+            pred = self.fake_action_score(noisy, sigma, fake_stats)
+            loss = masked_huber(pred, fake_actions, fake_mask, self.config.huber_c)
+            self.fake_action_optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.fake_action_score.parameters(), 1.0)
+            self.fake_action_optimizer.step()
+            losses.append(loss.detach())
+
+        if self.action_dmd_replay is not None:
+            self.action_dmd_replay.add(action_x0, video_stats, mask)
+        return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=self.device)
+
+    # ==================================================================
+    # Action-only DMD-lite student loss.
+    # ==================================================================
+    def _action_dmd_loss(self, action_x0, video_x0, mask, base_input_dict):
+        if not getattr(self, "enable_action_dmd", False):
+            zero = torch.tensor(0.0, device=self.device)
+            return zero, zero, zero
+        if self.fake_action_score is None:
+            zero = torch.tensor(0.0, device=self.device)
+            return zero, zero, zero
+
+        B, _, F_frames, _, _ = action_x0.shape
+        video_stats = pooled_video_stats(video_x0.detach())
+        fake_loss = self._update_fake_action_score(
+            action_x0.detach(), video_stats.detach(), mask.detach())
+
+        sigma_dmd, timesteps_dmd = self._sample_action_dmd_timesteps(B, F_frames)
+        action_sigma = self._add_action_dmd_noise(action_x0, timesteps_dmd)
+
+        # Teacher/fake scores are frozen for the student DMD update.  The video
+        # condition uses the student video endpoint but is detached to prevent
+        # action-DMD from hacking the video cache in the first implementation.
+        input_dict_dmd = {
+            'latent_dict': {
+                **base_input_dict['latent_dict'],
+                'noisy_latents': video_x0.detach(),
+                'timesteps': torch.zeros_like(base_input_dict['latent_dict']['timesteps']),
+            },
+            'action_dict': {
+                **base_input_dict['action_dict'],
+                'noisy_latents': action_sigma.detach(),
+                'timesteps': timesteps_dmd,
+            },
+            'chunk_size': base_input_dict['chunk_size'],
+            'window_size': base_input_dict['window_size'],
+        }
+
+        with torch.no_grad():
+            _, teacher_action_v_seq = self.teacher(input_dict_dmd, train_mode=True)
+            teacher_action_v = self._extract_action_v(teacher_action_v_seq, F_frames)
+            teacher_x0 = self._action_x0_from_v(action_sigma, teacher_action_v, sigma_dmd)
+            fake_x0 = self.fake_action_score(action_sigma, sigma_dmd, video_stats)
+            grad = normalize_dmd_gradient(
+                fake_x0.float() - teacher_x0.float(),
+                mask.float(),
+                sigma_dmd,
+                min_scale=self.config.action_dmd_grad_min_scale,
+            )
+            pseudo = (action_x0.float() - self.config.action_dmd_eta * grad).detach()
+
+        dmd_loss = masked_mse(action_x0.float(), pseudo, mask.float())
+        endpoint_loss = masked_huber(
+            action_x0,
+            base_input_dict['action_dict']['latent'].detach(),
+            mask,
+            self.config.huber_c,
+        )
+        return dmd_loss, endpoint_loss, fake_loss
 
     # ==================================================================
     # Consistency function: f(x_t, t) = c_skip * x_t + c_out * pred_x0
@@ -220,8 +359,30 @@ class StepMixin:
             aa_diff = (student_action_v.float() - action_targets.float().detach()) * mask
             action_aware_loss = (aa_diff ** 2).sum() / mask.sum().clamp(min=1)
 
+        # ---- 6c. Action-only DMD-lite distribution correction ----
+        action_dmd_loss = torch.tensor(0.0, device=self.device)
+        action_endpoint_loss = torch.tensor(0.0, device=self.device)
+        fake_action_loss = torch.tensor(0.0, device=self.device)
+        if getattr(self, "enable_action_dmd", False) and self.distill_action:
+            video_endpoint_for_dmd = (
+                student_video_pred if self.distill_video
+                else input_dict['latent_dict']['latent']
+            )
+            action_dmd_loss, action_endpoint_loss, fake_action_loss = self._action_dmd_loss(
+                student_action_pred,
+                video_endpoint_for_dmd,
+                actions_mask.float(),
+                input_dict,
+            )
+
+        dmd_warmup = min(
+            1.0,
+            float(max(self.step, 0)) / float(max(getattr(self.config, "action_dmd_warmup_steps", 1), 1)),
+        )
         loss = video_loss + self.config.action_loss_weight * action_loss \
-               + getattr(self.config, 'action_aware_weight', 0.0) * action_aware_loss
+               + getattr(self.config, 'action_aware_weight', 0.0) * action_aware_loss \
+               + getattr(self.config, 'action_endpoint_weight', 0.0) * action_endpoint_loss \
+               + dmd_warmup * getattr(self.config, 'action_dmd_weight', 0.0) * action_dmd_loss
 
         loss = loss / self.gradient_accumulation_steps
 
@@ -237,5 +398,8 @@ class StepMixin:
             "video_loss": video_loss.detach(),
             "action_loss": action_loss.detach() if self.distill_action else action_loss,
             "action_aware_loss": action_aware_loss.detach() if self.action_aware else action_aware_loss,
+            "action_dmd_loss": action_dmd_loss.detach(),
+            "action_endpoint_loss": action_endpoint_loss.detach(),
+            "fake_action_loss": fake_action_loss.detach(),
             "should_sync": should_sync,
         }
