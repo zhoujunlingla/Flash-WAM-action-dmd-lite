@@ -138,7 +138,7 @@ cfg.beta2 = 0.999
 cfg.weight_decay = 0.0
 cfg.max_grad_norm = 2.0
 cfg.warmup_steps = 100
-cfg.max_train_steps = 10000
+cfg.max_train_steps = int(os.environ.get("MAX_TRAIN_STEPS", "10000"))
 cfg.batch_size = 1
 cfg.gradient_accumulation_steps = 8
 cfg.load_worker = 0
@@ -148,8 +148,8 @@ cfg.cfg_prob = 0.0                # no random CFG dropout — teacher handles CF
 # ============================================================
 # Checkpointing & Logging
 # ============================================================
-cfg.save_interval = 1000
+cfg.save_interval = int(os.environ.get("SAVE_INTERVAL", "1000"))
 cfg.gc_interval = 50
-cfg.enable_wandb = True
+cfg.enable_wandb = os.environ.get("ENABLE_WANDB", "1") == "1"
 cfg.wandb_entity = None
 cfg.seed = 42
