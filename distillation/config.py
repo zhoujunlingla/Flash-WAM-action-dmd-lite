@@ -110,6 +110,7 @@ cfg.action_dmd_warmup_steps = int(os.environ.get("ACTION_DMD_WARMUP_STEPS", "100
 cfg.action_dmd_sigma_min = float(os.environ.get("ACTION_DMD_SIGMA_MIN", "0.05"))
 cfg.action_dmd_sigma_max = float(os.environ.get("ACTION_DMD_SIGMA_MAX", "0.30"))
 cfg.action_dmd_grad_min_scale = float(os.environ.get("ACTION_DMD_GRAD_MIN_SCALE", "0.01"))
+cfg.enable_action_endpoint = os.environ.get("ACTION_ENDPOINT_ENABLE", "0") == "1"
 cfg.action_endpoint_weight = float(os.environ.get("ACTION_ENDPOINT_WEIGHT", "0.05"))
 
 cfg.fake_action_hidden_dim = int(os.environ.get("FAKE_ACTION_HIDDEN_DIM", "1024"))

@@ -393,6 +393,13 @@ class StepMixin:
         action_dmd_loss = torch.tensor(0.0, device=self.device)
         action_endpoint_loss = torch.tensor(0.0, device=self.device)
         fake_action_loss = torch.tensor(0.0, device=self.device)
+        if getattr(self.config, "enable_action_endpoint", False) and self.distill_action:
+            action_endpoint_loss = masked_huber(
+                student_action_pred,
+                input_dict['action_dict']['latent'].detach(),
+                actions_mask.float(),
+                self.config.huber_c,
+            )
         if getattr(self, "enable_action_dmd", False) and self.distill_action:
             video_endpoint_for_dmd = (
                 student_video_pred if self.distill_video
