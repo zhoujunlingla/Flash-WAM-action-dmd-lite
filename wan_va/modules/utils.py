@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+from copy import deepcopy
+
 import torch
 from diffusers import AutoencoderKLWan
 from transformers import (
@@ -47,6 +49,11 @@ def load_transformer(
         transformer_path,
         torch_dtype=torch_dtype,
     )
+    target_embedder = getattr(model, "condition_embedder_action_target", None)
+    if target_embedder is not None and any(p.is_meta for p in target_embedder.parameters()):
+        model.condition_embedder_action_target = deepcopy(model.condition_embedder_action)
+        torch.nn.init.zeros_(model.condition_embedder_action_target.time_proj.weight)
+        torch.nn.init.zeros_(model.condition_embedder_action_target.time_proj.bias)
     return model.to(torch_device)
 
 
