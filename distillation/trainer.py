@@ -82,6 +82,18 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 logger.info(f"  k_action = {self.k_action}, "
                             f"action_loss_weight = {config.action_loss_weight}, "
                             f"mode = {self.action_distill_mode}")
+                if getattr(config, "enable_action_flowmap", False):
+                    logger.info("Action Flow-Map Distillation enabled")
+                    logger.info(f"  ratios = {config.action_flowmap_stride_ratios}")
+                    logger.info(f"  weights = {config.action_flowmap_loss_weights}")
+                    logger.info(
+                        f"  teacher_substeps = "
+                        f"{config.action_flowmap_teacher_min_substeps}-"
+                        f"{config.action_flowmap_teacher_max_substeps}")
+                    logger.info(
+                        f"  endpoint_weight = {config.action_flowmap_endpoint_weight}, "
+                        f"self_consistency_weight = "
+                        f"{config.action_flowmap_self_consistency_weight}")
             if self.action_aware:
                 logger.info(f"  action_aware_weight = {config.action_aware_weight}")
             logger.info(f"Empty embedding shape: {self.empty_emb.shape}")
@@ -238,6 +250,8 @@ class FlashWAMDistiller(DataMixin, StepMixin):
             mode.append("action")
         if self.action_aware:
             mode.append("action_aware")
+        if getattr(config, "enable_action_flowmap", False):
+            mode.append("action_flowmap")
         mode_str = "+".join(mode) if mode else "none"
         logger.info(f"Starting LCM {mode_str} distillation for {config.max_train_steps} steps ...")
         if self.distill_video:
@@ -256,6 +270,9 @@ class FlashWAMDistiller(DataMixin, StepMixin):
         acc_video_losses = []
         acc_action_losses = []
         acc_action_aware_losses = []
+        acc_action_flowmap_losses = []
+        acc_action_endpoint_losses = []
+        acc_action_self_consistency_losses = []
         step_in_acc = 0
 
         progress_bar = tqdm(
@@ -271,6 +288,12 @@ class FlashWAMDistiller(DataMixin, StepMixin):
             acc_video_losses.append(result["video_loss"])
             acc_action_losses.append(result["action_loss"])
             acc_action_aware_losses.append(result["action_aware_loss"])
+            acc_action_flowmap_losses.append(result.get(
+                "action_flowmap_loss", torch.tensor(0.0, device=self.device)))
+            acc_action_endpoint_losses.append(result.get(
+                "action_endpoint_loss", torch.tensor(0.0, device=self.device)))
+            acc_action_self_consistency_losses.append(result.get(
+                "action_self_consistency_loss", torch.tensor(0.0, device=self.device)))
             step_in_acc += 1
 
             if result["should_sync"]:
@@ -297,10 +320,17 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 avg_video_loss = dist_mean(torch.stack(acc_video_losses).sum()).item()
                 avg_action_loss = dist_mean(torch.stack(acc_action_losses).sum()).item()
                 avg_action_aware_loss = dist_mean(torch.stack(acc_action_aware_losses).sum()).item()
+                avg_action_flowmap_loss = dist_mean(torch.stack(acc_action_flowmap_losses).sum()).item()
+                avg_action_endpoint_loss = dist_mean(torch.stack(acc_action_endpoint_losses).sum()).item()
+                avg_action_self_consistency_loss = dist_mean(
+                    torch.stack(acc_action_self_consistency_losses).sum()).item()
                 acc_losses = []
                 acc_video_losses = []
                 acc_action_losses = []
                 acc_action_aware_losses = []
+                acc_action_flowmap_losses = []
+                acc_action_endpoint_losses = []
+                acc_action_self_consistency_losses = []
                 step_in_acc = 0
 
                 torch.cuda.synchronize()
@@ -325,7 +355,15 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                         log_dict["loss/video_consistency"] = avg_video_loss
                     if self.distill_action:
                         postfix["a"] = f"{avg_action_loss:.4f}"
-                        log_dict["loss/action_consistency"] = avg_action_loss
+                        if getattr(config, "enable_action_flowmap", False):
+                            postfix["afm"] = f"{avg_action_flowmap_loss:.4f}"
+                            postfix["ep"] = f"{avg_action_endpoint_loss:.4f}"
+                            postfix["sc"] = f"{avg_action_self_consistency_loss:.4f}"
+                            log_dict["loss/action_flowmap"] = avg_action_flowmap_loss
+                            log_dict["loss/action_endpoint"] = avg_action_endpoint_loss
+                            log_dict["loss/action_self_consistency"] = avg_action_self_consistency_loss
+                        else:
+                            log_dict["loss/action_consistency"] = avg_action_loss
                     if self.action_aware:
                         postfix["aa"] = f"{avg_action_aware_loss:.4f}"
                         log_dict["loss/action_aware"] = avg_action_aware_loss

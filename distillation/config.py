@@ -98,6 +98,24 @@ cfg.action_distill_mode = "x0"          # action consistency function parametriz
 cfg.action_aware_weight = 0.01          # small weight for action-aware regularizer
 
 # ============================================================
+# Action Flow-Map Distillation (disabled by default)
+# ============================================================
+# This replaces the action consistency target with teacher action trajectory
+# source->target transitions.  It does not train a fake score, distribution
+# critic, or any extra model.
+cfg.enable_action_flowmap = os.environ.get("ACTION_FLOWMAP_ENABLE", "0") == "1"
+cfg.action_flowmap_stride_ratios = [
+    float(x) for x in os.environ.get("ACTION_FLOWMAP_STRIDE_RATIOS", "0.5,1.0").split(",")
+]
+cfg.action_flowmap_loss_weights = [
+    float(x) for x in os.environ.get("ACTION_FLOWMAP_LOSS_WEIGHTS", "0.5,1.0").split(",")
+]
+cfg.action_flowmap_teacher_min_substeps = int(os.environ.get("ACTION_FLOWMAP_TEACHER_MIN_SUBSTEPS", "1"))
+cfg.action_flowmap_teacher_max_substeps = int(os.environ.get("ACTION_FLOWMAP_TEACHER_MAX_SUBSTEPS", "4"))
+cfg.action_flowmap_endpoint_weight = float(os.environ.get("ACTION_FLOWMAP_ENDPOINT_WEIGHT", "0.05"))
+cfg.action_flowmap_self_consistency_weight = float(os.environ.get("ACTION_FLOWMAP_SELF_CONSISTENCY_WEIGHT", "0.0"))
+
+# ============================================================
 # LCM Hyperparameters
 # ============================================================
 cfg.ema_decay = 0.995
@@ -116,7 +134,7 @@ cfg.beta2 = 0.999
 cfg.weight_decay = 0.0
 cfg.max_grad_norm = 2.0
 cfg.warmup_steps = 100
-cfg.max_train_steps = 10000
+cfg.max_train_steps = int(os.environ.get("MAX_TRAIN_STEPS", "10000"))
 cfg.batch_size = 1
 cfg.gradient_accumulation_steps = 8
 cfg.load_worker = 0
@@ -126,8 +144,8 @@ cfg.cfg_prob = 0.0                # no random CFG dropout — teacher handles CF
 # ============================================================
 # Checkpointing & Logging
 # ============================================================
-cfg.save_interval = 1000
+cfg.save_interval = int(os.environ.get("SAVE_INTERVAL", "1000"))
 cfg.gc_interval = 50
-cfg.enable_wandb = True
+cfg.enable_wandb = os.environ.get("ENABLE_WANDB", "1") == "1"
 cfg.wandb_entity = None
 cfg.seed = 42

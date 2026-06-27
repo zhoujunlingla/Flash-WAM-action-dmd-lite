@@ -14,20 +14,37 @@ import types
 
 
 def install_flash_attn_stub():
-    """Install a stub flash_attn module if the real one is unavailable."""
+    """Install FlashAttention compatibility aliases.
+
+    Prefer the real flash-attn package when it is installed. Some LingBot/Wan
+    code imports ``flash_attn_interface`` first. Installing a dummy interface
+    in that case silently disables FlashAttention, so expose real flash-attn
+    under the interface name before falling back to stubs.
+    """
+    try:
+        import flash_attn as real_flash_attn
+        if "flash_attn_interface" not in sys.modules:
+            alias = types.ModuleType("flash_attn_interface")
+            alias.__spec__ = importlib.machinery.ModuleSpec("flash_attn_interface", None)
+            alias.__version__ = getattr(real_flash_attn, "__version__", "real-flash-attn")
+            alias.flash_attn_func = real_flash_attn.flash_attn_func
+            alias.flash_attn_varlen_func = getattr(real_flash_attn, "flash_attn_varlen_func", None)
+            sys.modules["flash_attn_interface"] = alias
+            print("INFO: flash_attn_interface aliased to real flash_attn")
+        return
+    except Exception as e:
+        print(f"WARNING: real flash_attn unavailable ({e}); installing SDPA stubs")
+
     for mod_name in ("flash_attn_interface", "flash_attn"):
         if mod_name in sys.modules:
             continue
-        try:
-            __import__(mod_name)
-        except ImportError:
-            stub = types.ModuleType(mod_name)
-            stub.__spec__ = importlib.machinery.ModuleSpec(mod_name, None)
-            stub.__version__ = "0.0.0"
-            stub.flash_attn_func = None
-            stub.flash_attn_varlen_func = None
-            sys.modules[mod_name] = stub
-            print(f"WARNING: {mod_name} not available, installed stub (torch SDPA will be used)")
+        stub = types.ModuleType(mod_name)
+        stub.__spec__ = importlib.machinery.ModuleSpec(mod_name, None)
+        stub.__version__ = "0.0.0"
+        stub.flash_attn_func = None
+        stub.flash_attn_varlen_func = None
+        sys.modules[mod_name] = stub
+        print(f"WARNING: {mod_name} not available, installed stub (torch SDPA will be used)")
 
 
 class SafeMultiLatentLeRobotDataset:
