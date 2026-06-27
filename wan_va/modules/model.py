@@ -866,6 +866,21 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         current_condition_embedder = self.condition_embedder_action if action_mode else self.condition_embedder
         temb, timestep_proj = current_condition_embedder(
             latent_time_steps, dtype=latent_hidden_states.dtype)
+        if action_mode:
+            target_key = None
+            if "target_timesteps" in input_dict:
+                target_key = "target_timesteps"
+            elif input_dict.get("use_target_timesteps", False) and "cond_timesteps" in input_dict:
+                target_key = "cond_timesteps"
+            if target_key is not None:
+                target_time_steps = torch.repeat_interleave(
+                    input_dict[target_key],
+                    (input_dict['noisy_latents'].shape[-2] // pach_scale_h) *
+                    (input_dict['noisy_latents'].shape[-1] // pach_scale_w), dim=1)
+                target_temb, target_timestep_proj = current_condition_embedder(
+                    target_time_steps, dtype=latent_hidden_states.dtype)
+                temb = temb + target_temb
+                timestep_proj = timestep_proj + target_timestep_proj
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
         for block in self.blocks:

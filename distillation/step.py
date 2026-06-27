@@ -79,6 +79,44 @@ class StepMixin:
         scaled = int(math.ceil(float(ratio) / float(min_ratio)))
         return max(min_steps, min(max_steps, scaled))
 
+    def _max_action_flowmap_stride(self):
+        ratios, _ = self._action_flowmap_ratios_and_weights()
+        return max(1, max(int(round(float(self.k_action) * float(r))) for r in ratios))
+
+    def _resample_action_flowmap_source(self, input_dict):
+        action_dict = input_dict['action_dict']
+        clean_action = action_dict['latent']
+        max_stride = self._max_action_flowmap_stride()
+        max_start = int(self.config.num_train_timesteps) - 1 - max_stride
+        if max_start < 0:
+            raise ValueError(
+                "action flow-map stride is longer than the training schedule; "
+                "reduce ACTION_FLOWMAP_STRIDE_RATIOS or increase num_ddim_timesteps_action")
+
+        B = clean_action.shape[0]
+        num_frames = clean_action.shape[2]
+        source_ids = torch.randint(
+            0, max_start + 1, (num_frames,), device=self.device)
+        sigma_start, timesteps_start = self._ids_to_sigma_timestep(
+            self.train_scheduler_action, source_ids)
+
+        noise = torch.randn_like(clean_action)
+        noisy_action = (1.0 - self._sigma_5d(sigma_start, clean_action)) * clean_action + \
+            self._sigma_5d(sigma_start, clean_action) * noise
+        targets = noise - clean_action
+
+        action_mask = action_dict.get('actions_mask')
+        if action_mask is not None:
+            mask = action_mask.float()
+            noisy_action = noisy_action * mask
+            targets = targets * mask
+
+        action_dict['noisy_latents'] = noisy_action
+        action_dict['targets'] = targets
+        action_dict['timesteps'] = timesteps_start[None].repeat(B, 1)
+        action_dict['cond_timesteps'] = torch.zeros_like(action_dict['timesteps'])
+        return source_ids, torch.tensor(0.0, device=self.device)
+
     def _huber_or_l2_video(self, pred, target):
         if self.config.loss_type == "huber":
             c = self.config.huber_c
@@ -287,6 +325,10 @@ class StepMixin:
 
         # ---- 1. Prepare input_dict (identical to native training) ----
         input_dict = self._prepare_input_dict(batch)
+        action_flowmap_clip_rate = torch.tensor(0.0, device=self.device)
+        if enable_action_flowmap:
+            action_ts_ids, action_flowmap_clip_rate = \
+                self._resample_action_flowmap_source(input_dict)
 
         # ---- 2. Compute sigma_start and sigma_end for LCM (video) ----
         video_timesteps = input_dict['latent_dict']['timesteps'][0]  # [F]
@@ -301,16 +343,18 @@ class StepMixin:
 
         # ---- 2b. Compute sigma pairs for actions ----
         if self.distill_action:
-            action_timesteps = input_dict['action_dict']['timesteps'][0]  # [F]
-            sched_ts_a = self.train_scheduler_action.timesteps
-            action_ts_ids = torch.argmin(
-                (sched_ts_a[:, None] - action_timesteps.cpu()).abs(), dim=0)
+            if not enable_action_flowmap:
+                action_timesteps = input_dict['action_dict']['timesteps'][0]  # [F]
+                sched_ts_a = self.train_scheduler_action.timesteps
+                action_ts_ids = torch.argmin(
+                    (sched_ts_a[:, None] - action_timesteps.cpu()).abs(), dim=0)
 
-            sigma_start_action = self.train_scheduler_action.sigmas[action_ts_ids].to(self.device)
+            sigma_start_action, _ = self._ids_to_sigma_timestep(
+                self.train_scheduler_action, action_ts_ids)
             end_ids_action = (action_ts_ids + self.k_action).clamp(
                 max=self.config.num_train_timesteps - 1)
-            sigma_end_action = self.train_scheduler_action.sigmas[end_ids_action].to(self.device)
-            timesteps_end_action = self.train_scheduler_action.timesteps[end_ids_action].to(self.device)
+            sigma_end_action, timesteps_end_action = self._ids_to_sigma_timestep(
+                self.train_scheduler_action, end_ids_action)
 
         # ---- 3. Teacher CFG Euler step ----
         cfg_scale = self.config.cfg_min + torch.rand(1).item() * (
@@ -460,10 +504,16 @@ class StepMixin:
             aa_diff = (student_action_v.float() - action_targets.float().detach()) * mask
             action_aware_loss = (aa_diff ** 2).sum() / mask.sum().clamp(min=1)
 
+        sc_weight = float(getattr(self.config, 'action_flowmap_self_consistency_weight', 0.0))
+        sc_warmup_steps = int(getattr(
+            self.config, 'action_flowmap_self_consistency_warmup_steps', 0))
+        if sc_weight > 0.0 and sc_warmup_steps > 0:
+            sc_weight *= min(1.0, float(self.step + 1) / float(sc_warmup_steps))
+
         loss = video_loss + self.config.action_loss_weight * action_loss \
                + getattr(self.config, 'action_aware_weight', 0.0) * action_aware_loss \
                + getattr(self.config, 'action_flowmap_endpoint_weight', 0.0) * action_endpoint_loss \
-               + getattr(self.config, 'action_flowmap_self_consistency_weight', 0.0) * action_self_consistency_loss
+               + sc_weight * action_self_consistency_loss
 
         loss = loss / self.gradient_accumulation_steps
 
@@ -482,5 +532,6 @@ class StepMixin:
             "action_flowmap_loss": action_flowmap_loss.detach(),
             "action_endpoint_loss": action_endpoint_loss.detach(),
             "action_self_consistency_loss": action_self_consistency_loss.detach(),
+            "action_flowmap_clip_rate": action_flowmap_clip_rate.detach(),
             "should_sync": should_sync,
         }

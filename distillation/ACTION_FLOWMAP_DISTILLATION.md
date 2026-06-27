@@ -17,7 +17,7 @@ teacher action trajectory:  x_s -> x_e^T
 student transition:         Phi_a^S(x_s, sigma_s, sigma_e, C) -> x_e^T
 ```
 
-The action student learns multiple source-to-target transitions, such as:
+The action student can learn multiple source-to-target transitions, such as:
 
 ```text
 sigma_s -> sigma_e at 0.5 stride
@@ -57,6 +57,20 @@ clean teacher video context that will be unavailable at runtime.
 No DiT architecture change is required.  The existing action
 `cond_timesteps` field is reused to carry the target timestep `sigma_e`, while
 the normal action `timesteps` field carries the source timestep `sigma_s`.
+For action-only inference, the model also accepts an explicit
+`target_timesteps` field so a router can request `sigma_s -> sigma_e` directly.
+
+## Source Timestep Sampling
+
+When action flow-map is enabled, action source timesteps are resampled from the
+legal range implied by the largest configured stride:
+
+```text
+max_start = num_train_timesteps - 1 - max_stride
+```
+
+This avoids clipped transitions such as `start + stride > 999`, which would
+otherwise turn a large-stride target into a shorter or near-identity target.
 
 ## Loss
 
@@ -82,14 +96,16 @@ Use `distillation/config_robotwin_1v2a.py` for RoboTwin v1/a2:
 
 ```bash
 ACTION_FLOWMAP_ENABLE=1
-ACTION_FLOWMAP_STRIDE_RATIOS=0.5,1.0
-ACTION_FLOWMAP_LOSS_WEIGHTS=0.5,1.0
-ACTION_FLOWMAP_TEACHER_MIN_SUBSTEPS=1
-ACTION_FLOWMAP_TEACHER_MAX_SUBSTEPS=4
+ACTION_FLOWMAP_STRIDE_RATIOS=1.0
+ACTION_FLOWMAP_LOSS_WEIGHTS=1.0
+ACTION_FLOWMAP_TEACHER_MIN_SUBSTEPS=8
+ACTION_FLOWMAP_TEACHER_MAX_SUBSTEPS=16
 ACTION_FLOWMAP_ENDPOINT_WEIGHT=0.05
-ACTION_FLOWMAP_SELF_CONSISTENCY_WEIGHT=0.05
+ACTION_FLOWMAP_SELF_CONSISTENCY_WEIGHT=0.0
 ```
 
-Teacher action rollout substeps scale with stride.  With the default ratios,
-the shorter target uses one teacher substep and the deploy-scale target uses two
-teacher substeps, capped by `ACTION_FLOWMAP_TEACHER_MAX_SUBSTEPS`.
+Teacher action rollout substeps scale with stride and are capped by
+`ACTION_FLOWMAP_TEACHER_MAX_SUBSTEPS`.  The first stable experiment should use a
+single deploy-scale stride and keep self-consistency off.  After the endpoint
+and flow-map losses are stable, add shorter ratios and optionally enable
+self-consistency with a warmup.

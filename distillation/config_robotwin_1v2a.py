@@ -22,15 +22,17 @@ cfg.action_aware_weight = 0.01
 
 cfg.enable_action_flowmap = os.environ.get("ACTION_FLOWMAP_ENABLE", "1") == "1"
 cfg.action_flowmap_stride_ratios = [
-    float(x) for x in os.environ.get("ACTION_FLOWMAP_STRIDE_RATIOS", "0.5,1.0").split(",")
+    float(x) for x in os.environ.get("ACTION_FLOWMAP_STRIDE_RATIOS", "1.0").split(",")
 ]
 cfg.action_flowmap_loss_weights = [
-    float(x) for x in os.environ.get("ACTION_FLOWMAP_LOSS_WEIGHTS", "0.5,1.0").split(",")
+    float(x) for x in os.environ.get("ACTION_FLOWMAP_LOSS_WEIGHTS", "1.0").split(",")
 ]
-cfg.action_flowmap_teacher_min_substeps = int(os.environ.get("ACTION_FLOWMAP_TEACHER_MIN_SUBSTEPS", "1"))
-cfg.action_flowmap_teacher_max_substeps = int(os.environ.get("ACTION_FLOWMAP_TEACHER_MAX_SUBSTEPS", "4"))
+cfg.action_flowmap_teacher_min_substeps = int(os.environ.get("ACTION_FLOWMAP_TEACHER_MIN_SUBSTEPS", "8"))
+cfg.action_flowmap_teacher_max_substeps = int(os.environ.get("ACTION_FLOWMAP_TEACHER_MAX_SUBSTEPS", "16"))
 cfg.action_flowmap_endpoint_weight = float(os.environ.get("ACTION_FLOWMAP_ENDPOINT_WEIGHT", "0.05"))
-cfg.action_flowmap_self_consistency_weight = float(os.environ.get("ACTION_FLOWMAP_SELF_CONSISTENCY_WEIGHT", "0.05"))
+cfg.action_flowmap_self_consistency_weight = float(os.environ.get("ACTION_FLOWMAP_SELF_CONSISTENCY_WEIGHT", "0.0"))
+cfg.action_flowmap_self_consistency_warmup_steps = int(
+    os.environ.get("ACTION_FLOWMAP_SELF_CONSISTENCY_WARMUP_STEPS", "2000"))
 
 cfg.snr_shift = 5.0
 cfg.action_snr_shift = 1.0

@@ -273,6 +273,7 @@ class FlashWAMDistiller(DataMixin, StepMixin):
         acc_action_flowmap_losses = []
         acc_action_endpoint_losses = []
         acc_action_self_consistency_losses = []
+        acc_action_flowmap_clip_rates = []
         step_in_acc = 0
 
         progress_bar = tqdm(
@@ -294,6 +295,8 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 "action_endpoint_loss", torch.tensor(0.0, device=self.device)))
             acc_action_self_consistency_losses.append(result.get(
                 "action_self_consistency_loss", torch.tensor(0.0, device=self.device)))
+            acc_action_flowmap_clip_rates.append(result.get(
+                "action_flowmap_clip_rate", torch.tensor(0.0, device=self.device)))
             step_in_acc += 1
 
             if result["should_sync"]:
@@ -324,6 +327,8 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 avg_action_endpoint_loss = dist_mean(torch.stack(acc_action_endpoint_losses).sum()).item()
                 avg_action_self_consistency_loss = dist_mean(
                     torch.stack(acc_action_self_consistency_losses).sum()).item()
+                avg_action_flowmap_clip_rate = dist_mean(
+                    torch.stack(acc_action_flowmap_clip_rates).mean()).item()
                 acc_losses = []
                 acc_video_losses = []
                 acc_action_losses = []
@@ -331,6 +336,7 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 acc_action_flowmap_losses = []
                 acc_action_endpoint_losses = []
                 acc_action_self_consistency_losses = []
+                acc_action_flowmap_clip_rates = []
                 step_in_acc = 0
 
                 torch.cuda.synchronize()
@@ -362,6 +368,7 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                             log_dict["loss/action_flowmap"] = avg_action_flowmap_loss
                             log_dict["loss/action_endpoint"] = avg_action_endpoint_loss
                             log_dict["loss/action_self_consistency"] = avg_action_self_consistency_loss
+                            log_dict["train/action_flowmap_clip_rate"] = avg_action_flowmap_clip_rate
                         else:
                             log_dict["loss/action_consistency"] = avg_action_loss
                     if self.action_aware:
