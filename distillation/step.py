@@ -59,9 +59,34 @@ class StepMixin:
     # Native action scheduler noise wrapper for action endpoints.
     # ==================================================================
     def _add_action_dmd_noise(self, action_x0, sigma_timesteps):
+        """Add action noise with per-frame sigma broadcast.
+
+        The native FlowMatchScheduler.add_noise helper assumes video-shaped
+        timesteps and reshapes sigma along a single temporal dimension. DMD
+        samples action timesteps as [B, F], so using the scheduler helper
+        creates invalid video-style shapes such as [1, 1, 1000, 1, 1].
+        Here we map each action timestep back to the action scheduler sigma and
+        broadcast it as [B, 1, F, 1, 1], matching action_x0 = [B, C, F, N, 1].
+        """
         noise = torch.randn_like(action_x0)
-        return self.train_scheduler_action.add_noise(
-            action_x0, noise, sigma_timesteps, t_dim=2)
+        ts = sigma_timesteps.to(device=action_x0.device)
+        if ts.ndim == 1:
+            ts = ts[None].expand(action_x0.shape[0], action_x0.shape[2])
+        elif ts.ndim == 0:
+            ts = ts.reshape(1, 1).expand(action_x0.shape[0], action_x0.shape[2])
+
+        # If caller already supplies sigma in [0, 1], use it directly.
+        if ts.is_floating_point() and torch.all((ts >= 0) & (ts <= 1)):
+            sigma = ts.to(dtype=action_x0.dtype)
+        else:
+            sched_t = self.train_scheduler_action.timesteps.to(action_x0.device)
+            sched_s = self.train_scheduler_action.sigmas.to(action_x0.device)
+            flat = ts.reshape(-1).to(sched_t.dtype)
+            idx = torch.argmin((sched_t[:, None] - flat[None]).abs(), dim=0)
+            sigma = sched_s[idx].reshape(ts.shape).to(dtype=action_x0.dtype)
+
+        sigma_5d = sigma[:, None, :, None, None].to(action_x0.device)
+        return (1 - sigma_5d) * action_x0 + sigma_5d * noise
 
     # ==================================================================
     # Train fake action score on current/replay student action endpoints.
@@ -85,9 +110,14 @@ class StepMixin:
             ) if self.action_dmd_replay is not None else None
             if replay is not None:
                 replay_actions, replay_stats, replay_mask = replay
-                fake_actions = torch.cat([fake_actions, replay_actions], dim=0)
-                fake_stats = torch.cat([fake_stats, replay_stats], dim=0)
-                fake_mask = torch.cat([fake_mask, replay_mask], dim=0)
+                # RoboTwin batches can have different temporal action lengths.
+                # Only mix replay samples with matching action/mask shapes;
+                # otherwise the fake-score update remains on-policy for this
+                # batch instead of failing on torch.cat.
+                if replay_actions.shape[1:] == fake_actions.shape[1:] and replay_mask.shape[1:] == fake_mask.shape[1:]:
+                    fake_actions = torch.cat([fake_actions, replay_actions], dim=0)
+                    fake_stats = torch.cat([fake_stats, replay_stats], dim=0)
+                    fake_mask = torch.cat([fake_mask, replay_mask], dim=0)
 
             sigma, timesteps = self._sample_action_dmd_timesteps(
                 fake_actions.shape[0], fake_actions.shape[2])

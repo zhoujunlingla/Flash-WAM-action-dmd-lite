@@ -16,28 +16,52 @@ import torch.nn.functional as F
 class FakeActionScore(nn.Module):
     """Small action fake-score network.
 
-    FastGen/DMD2 usually uses a full fake score model.  For WAM action-first
+    FastGen/DMD2 usually uses a full fake score model. For WAM action-first
     refinement we start with a lightweight action-only estimator because action
     latents are low dimensional and directly tied to RoboTwin success.
+
+    The fake score is applied element-wise with shared weights instead of
+    flattening the whole action chunk. RoboTwin batches can expose different
+    temporal lengths, so this keeps the DMD-lite path shape-stable while still
+    producing a distribution gradient for every action endpoint element.
     """
 
-    def __init__(self, action_size, hidden_dim=1024, depth=3):
+    def __init__(self, action_size, hidden_dim=256, depth=3):
         super().__init__()
-        in_dim = action_size + 4  # flattened action + sigma + video mean/std/absmean
+        del action_size
+        hidden_dim = min(int(hidden_dim), 256)
+        in_dim = 5  # scalar action + sigma + video mean/std/absmean
         layers = []
         for i in range(depth):
             layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, hidden_dim))
             layers.append(nn.SiLU())
-        layers.append(nn.Linear(hidden_dim, action_size))
+        layers.append(nn.Linear(hidden_dim, 1))
         self.net = nn.Sequential(*layers)
 
     def forward(self, action_sigma, sigma, video_stats):
-        shape = action_sigma.shape
-        flat_action = action_sigma.flatten(1).float()
-        sigma_feat = sigma.float().mean(dim=1, keepdim=True)
-        cond = torch.cat([flat_action, sigma_feat, video_stats.float()], dim=1)
-        pred = self.net(cond)
-        return pred.view(shape).to(action_sigma.dtype)
+        if action_sigma.ndim != 5:
+            raise ValueError(f"Expected action_sigma [B,C,F,N,1], got {tuple(action_sigma.shape)}")
+        bsz, channels, frames, tokens, one = action_sigma.shape
+
+        sigma = sigma.to(device=action_sigma.device).float()
+        if sigma.ndim == 0:
+            sigma = sigma.reshape(1, 1).expand(bsz, frames)
+        elif sigma.ndim == 1:
+            if sigma.numel() == frames:
+                sigma = sigma[None].expand(bsz, frames)
+            else:
+                sigma = sigma.reshape(bsz, 1).expand(bsz, frames)
+        elif sigma.shape != (bsz, frames):
+            sigma = sigma.reshape(bsz, -1).mean(dim=1, keepdim=True).expand(bsz, frames)
+
+        action_flat = action_sigma.float().permute(0, 2, 1, 3, 4).reshape(-1, 1)
+        sigma_flat = sigma[:, :, None, None, None].expand(
+            bsz, frames, channels, tokens, one).reshape(-1, 1)
+        stats_flat = video_stats.float()[:, None, None, None, :].expand(
+            bsz, frames, channels, tokens, 3).reshape(-1, 3)
+        cond = torch.cat([action_flat, sigma_flat, stats_flat], dim=1)
+        pred = self.net(cond).reshape(bsz, frames, channels, tokens, one)
+        return pred.permute(0, 2, 1, 3, 4).contiguous().to(action_sigma.dtype)
 
 
 class ActionDMDReplayBuffer:

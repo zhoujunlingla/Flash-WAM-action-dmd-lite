@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import os
 import torch
 from diffusers import AutoencoderKLWan
 from transformers import (
@@ -43,9 +44,13 @@ def load_transformer(
     torch_dtype,
     torch_device,
 ):
+    kwargs = {"torch_dtype": torch_dtype}
+    attn_mode = os.environ.get("FLASHWAM_ATTN_MODE")
+    if attn_mode:
+        kwargs["attn_mode"] = attn_mode
     model = WanTransformer3DModel.from_pretrained(
         transformer_path,
-        torch_dtype=torch_dtype,
+        **kwargs,
     )
     return model.to(torch_device)
 
