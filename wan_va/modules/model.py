@@ -585,6 +585,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                         "patch_embedding_mlp",
                                         "condition_embedder", 
                                         'condition_embedder_action',
+                                        'condition_embedder_action_target',
                                         "norm"]
     _no_split_modules = ["WanTransformerBlock"]
     _keep_in_fp32_modules = ["time_embedder", 
@@ -642,6 +643,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             pos_embed_seq_len=pos_embed_seq_len,
         )
         self.condition_embedder_action = deepcopy(self.condition_embedder)
+        self.condition_embedder_action_target = deepcopy(self.condition_embedder_action)
+        nn.init.zeros_(self.condition_embedder_action_target.time_proj.weight)
+        nn.init.zeros_(self.condition_embedder_action_target.time_proj.bias)
 
         self.blocks = nn.ModuleList([
             WanTransformerBlock(inner_dim,
@@ -695,14 +699,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             raise ValueError(f"Unsupported input type: {input_type}")
         return hidden_states
 
-    def _time_embed(self, timesteps, H, W, dtype, action_mode=False):
+    def _time_embed(self, timesteps, H, W, dtype, action_mode=False, action_target_mode=False):
         pach_scale_h, pach_scale_w = (1, 1) if action_mode else (
             self.patch_size[1], self.patch_size[2])
         latent_time_steps = torch.repeat_interleave(
             timesteps,
             (H // pach_scale_h) *
             (W // pach_scale_w), dim=1)  # L
-        current_condition_embedder = self.condition_embedder_action if action_mode else self.condition_embedder
+        if action_target_mode:
+            current_condition_embedder = self.condition_embedder_action_target
+        else:
+            current_condition_embedder = self.condition_embedder_action if action_mode else self.condition_embedder
         temb, timestep_proj = current_condition_embedder(
             latent_time_steps, dtype=dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
@@ -755,6 +762,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                         action_dict['noisy_latents'].shape[-1], 
                         dtype=hidden_states.dtype, 
                         action_mode=True)
+        if 'action_target_timesteps' in action_dict:
+            _, action_target_timestep_proj = self._time_embed(
+                        action_dict['action_target_timesteps'].flatten(0, 1)[None],
+                        action_dict['noisy_latents'].shape[-2],
+                        action_dict['noisy_latents'].shape[-1],
+                        dtype=hidden_states.dtype,
+                        action_mode=True,
+                        action_target_mode=True)
+            action_noisy_len = action_hidden_states.shape[1]
+            action_timestep_proj[:, :action_noisy_len] = \
+                action_timestep_proj[:, :action_noisy_len] + action_target_timestep_proj
         temb = torch.cat([latent_temb, action_temb], dim=1)
         timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
 
@@ -870,16 +888,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             target_key = None
             if "target_timesteps" in input_dict:
                 target_key = "target_timesteps"
-            elif input_dict.get("use_target_timesteps", False) and "cond_timesteps" in input_dict:
-                target_key = "cond_timesteps"
             if target_key is not None:
                 target_time_steps = torch.repeat_interleave(
                     input_dict[target_key],
                     (input_dict['noisy_latents'].shape[-2] // pach_scale_h) *
                     (input_dict['noisy_latents'].shape[-1] // pach_scale_w), dim=1)
-                target_temb, target_timestep_proj = current_condition_embedder(
+                _, target_timestep_proj = self.condition_embedder_action_target(
                     target_time_steps, dtype=latent_hidden_states.dtype)
-                temb = temb + target_temb
                 timestep_proj = timestep_proj + target_timestep_proj
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 

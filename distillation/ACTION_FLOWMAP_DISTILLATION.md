@@ -54,11 +54,30 @@ clean teacher video context that will be unavailable at runtime.
 
 ## Target-Time Conditioning
 
-No DiT architecture change is required.  The existing action
-`cond_timesteps` field is reused to carry the target timestep `sigma_e`, while
-the normal action `timesteps` field carries the source timestep `sigma_s`.
-For action-only inference, the model also accepts an explicit
-`target_timesteps` field so a router can request `sigma_s -> sigma_e` directly.
+The normal action `timesteps` field carries the source timestep `sigma_s`.
+The clean action condition keeps its original `cond_timesteps=0`; it is not
+used to carry the target timestep.  The target timestep `sigma_e` is passed
+through a separate zero-initialized target-time embedder:
+
+```text
+train path:      action_dict["action_target_timesteps"]
+action sampler:  input_dict["target_timesteps"]
+```
+
+The target-time projection is added only to noisy action tokens.  This keeps the
+clean action condition clean and makes the training path match the action-only
+inference path used by future routers.
+
+Sanity check before a long run:
+
+```text
+fix x_s, sigma_s, C
+compare Phi_a(x_s, sigma_s, sigma_e=0.5, C)
+     vs Phi_a(x_s, sigma_s, sigma_e=0.0, C)
+```
+
+The two predictions should differ; otherwise target-time conditioning is not
+being used.
 
 ## Source Timestep Sampling
 

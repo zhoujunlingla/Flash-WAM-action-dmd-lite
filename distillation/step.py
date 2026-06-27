@@ -142,8 +142,14 @@ class StepMixin:
         action_target_timesteps=None,
     ):
         latent_zero_ts = torch.zeros_like(base_input_dict['latent_dict']['timesteps'])
-        if action_target_timesteps is None:
-            action_target_timesteps = base_input_dict['action_dict']['cond_timesteps']
+        action_dict = {
+            **base_input_dict['action_dict'],
+            'noisy_latents': action_latents,
+            'timesteps': action_timesteps,
+            'cond_timesteps': base_input_dict['action_dict']['cond_timesteps'],
+        }
+        if action_target_timesteps is not None:
+            action_dict['action_target_timesteps'] = action_target_timesteps
         return {
             'latent_dict': {
                 **base_input_dict['latent_dict'],
@@ -152,12 +158,7 @@ class StepMixin:
                 'timesteps': latent_zero_ts,
                 'cond_timesteps': latent_zero_ts,
             },
-            'action_dict': {
-                **base_input_dict['action_dict'],
-                'noisy_latents': action_latents,
-                'timesteps': action_timesteps,
-                'cond_timesteps': action_target_timesteps,
-            },
+            'action_dict': action_dict,
             'chunk_size': base_input_dict['chunk_size'],
             'window_size': base_input_dict['window_size'],
         }
